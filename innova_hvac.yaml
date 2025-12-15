@@ -1,0 +1,329 @@
+###############################################################
+#  ESPHome – ESP01s Modbus Bridge for HVAC Reverse Engineered
+###############################################################
+substitutions:
+  device_name: hvac-innova
+  friendly_name: "Innova HVAC"
+  modbus_update_interval: "6s"
+  # Modbus slave address
+  modbus_address: "0x01"
+  
+esphome:
+  name: ${device_name}
+
+esp8266:
+  board: esp01_1m
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  
+  # Enable fallback hotspot in case wifi connection fails
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_password
+
+logger:
+  level: INFO          # Enable full debug for validation
+  baud_rate: 0          # Disable UART0 logging so TX/RX can be used for Modbus
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    id: my_ota
+    password: !secret ota_password
+
+
+# Web server for diagnostics (optional, can be removed to save memory)
+web_server:
+  port: 80
+  # auth:
+    # username: !secret web_username
+    # password: !secret web_password
+    
+###############################################################
+# UART + Modbus
+###############################################################
+uart:
+  id: uart_bus
+  tx_pin: 1                 # ESP01s TX
+  rx_pin: 3                 # ESP01s RX
+  baud_rate: 9600
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 1
+
+modbus:
+  uart_id: uart_bus
+  send_wait_time: 200ms
+
+modbus_controller:
+  - id: hvac
+    address: ${modbus_address}
+    update_interval: ${modbus_update_interval}
+    command_throttle: 200ms
+    setup_priority: -10
+    max_cmd_retries: 1
+    
+globals:
+  - id: last_mode
+    type: int
+    restore_value: yes
+    initial_value: '5'    
+
+###############################################################
+# SENSORS – READ REGISTERS (FC03)
+###############################################################
+sensor:
+
+  # Setpoint temperature (read)
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: setpoint_read
+    name: "HVAC Setpoint Temperature"
+    address: 4098
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    force_new_range: true
+
+  # Ambient temperature
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: ambient_temp
+    name: "HVAC Ambient Temperature"
+    address: 4129
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    force_new_range: true
+
+  # Fan speed (raw)
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: fan_speed_read
+    name: "Fan Speed (0-6)"
+    address: 4140
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+    
+text_sensor:
+  # Operating mode
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: mode_read
+    name: "Current Operating Mode"
+    address: 4139
+    register_type: holding
+    raw_encode: HEXBYTES 
+    force_new_range: true
+    lambda: |-
+      uint16_t value = modbus_controller::word_from_hex_str(x, 0); 
+      switch (value) {
+        case 0: return std::string("Auto");
+        case 1:
+          id(last_mode) = 1;
+          return std::string("Cooling");
+        case 2:
+          id(last_mode) = 3;
+          return std::string("Dehumidification");
+        case 4:
+          id(last_mode) = 0;
+          return std::string("Heating");
+        case 6:
+          id(last_mode) = 4;
+          return std::string("Fan Only");
+        case 8: return std::string("Standby");
+        default: return std::string("Unknown");
+      }
+
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: power_mode
+    name: "Current Power Mode"
+    address: 4101
+    register_type: holding
+    raw_encode: HEXBYTES 
+    force_new_range: true
+    lambda: |-
+      uint16_t value = modbus_controller::word_from_hex_str(x, 0); 
+      switch (value) {
+        case 33: return std::string("On (Normal)");
+        case 34: return std::string("Standby");
+        case 35: return std::string("On (Nightmode)");
+        case 32: return std::string("Standby");
+        default: return std::string("Unknown");
+      }
+    
+    # Rotation status
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: rotation_status
+    name: "Rotation Status"
+    address: 4100
+    register_type: holding
+    raw_encode: HEXBYTES 
+    force_new_range: true
+    lambda: |-
+      uint16_t value = modbus_controller::word_from_hex_str(x, 0); 
+      switch (value) {
+        case 0: return std::string("On");
+        case 7: return std::string("Off");
+        default: return std::string("Unknown");
+      }
+      
+###############################################################
+# SWITCHES – WRITE REGISTERS (FC06)
+###############################################################
+
+# Power OFF → Reg 1, value 2
+switch:
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: power_switch
+    name: "HVAC Power"
+    address: 1
+    register_type: holding
+    icon: mdi:power
+    bitmask: 1
+    lambda: |-
+      if (id(power_num).state == 2) {
+        return false;
+      } else {
+        return true;
+      }
+    on_turn_on:
+      then:
+        - number.set:
+            id: power_num
+            value: !lambda "float p = id(last_mode); return p;"
+    
+    on_turn_off:
+      then:
+        - number.set:
+            id: power_num
+            value: 2
+
+  # Rotation ON/OFF → Reg 7
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: hvac_rotation_switch
+    name: "HVAC Rotation"
+    address: 7
+    register_type: holding
+    icon: mdi:rotate-3d-variant
+    bitmask: 1
+    inverted: true
+    assumed_state: false
+    force_new_range: true
+    write_lambda: |-
+      if (id(hvac_rotation_switch).state) {
+        uint16_t x = 0;
+        return true;
+      } else {
+        uint16_t x = 7;
+        return false;
+      }
+      
+    # Nightmode ON/OFF → Reg 8
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: nightmode_switch
+    name: "Night mode"
+    address: 8
+    register_type: holding
+    icon: mdi:weather-night
+    bitmask: 1
+    force_new_range: true
+      
+###############################################################
+# MODE SELECT – Write register 1
+# Cooling=1; Heat=0; Dehumid=3; FanOnly=4; Auto=5
+###############################################################
+select:
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: hvac_mode_select
+    name: "HVAC Mode"
+    address: 1
+    optimistic: true
+    lambda: |-
+      if (x == 2) {
+        uint16_t newidx = id(last_mode);
+        switch (newidx) {
+        case 0: return std::string("Heat");
+        case 1: return std::string("Cooling");
+        case 4: return std::string("Fan Only");
+        case 5: return std::string("Auto");
+        }
+        return std::string("");;
+      } else {
+        return {};
+      }
+    write_lambda: |-
+      if (id(power_num).state == 2) {
+        id(last_mode) = value;
+        return {};
+      } else {
+        return value;
+      }
+    optionsmap:
+      "Heat": 0
+      "Cooling": 1
+      #"Standby": 2
+      "Dehumidification": 3
+      "Fan Only": 4
+      "Auto": 5
+
+
+
+###############################################################
+# FAN SPEED SELECT – Reg 6
+# Auto=0; 1=Speed1; 2=Speed2; 3=Speed3; 4=Turbo
+###############################################################
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: hvac_fan_select
+    name: "Fan Speed Mode"
+    address: 6
+    optimistic: true
+    optionsmap:
+      "Auto": 0
+      "Speed 1": 1
+      "Speed 2": 2
+      "Speed 3": 3
+      "Turbo": 4
+
+
+###############################################################
+# SETPOINT WRITE – Reg 5 (16–30°C)
+###############################################################
+number:
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: hvac_setpoint_write
+    name: "HVAC Setpoint"
+    address: 5     # Register 5 (FC06)
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 16
+    max_value: 30
+    step: 1
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: hvac
+    id: power_num
+    address: 1
+    internal: true
+    disabled_by_default: true
+    
+###############################################################
+# END OF FILE
+###############################################################
