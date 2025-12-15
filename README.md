@@ -388,6 +388,9 @@ climate:
 
 **🎨 Done!** You now have a beautiful, fully-functional thermostat interface!
 
+**📱 Dashboard Preview**
+![Innova HVAC Dashboard](https://raw.githubusercontent.com/HossainGh/esphome-innova/main/card.PNG)
+
 ---
 
 ## 🎮 Supported Features
